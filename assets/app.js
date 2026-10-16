@@ -3,21 +3,32 @@
   const base=document.body.dataset.base;
   const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
   const KEY='franka-public-reading-v1', THEME='franka-public-theme-v1';
-  let persistent=true, index=[], saved=new Set(), read=new Set(), timer;
+  let persistent=true, writable=true, backedUp=false, initialState=null, index=[], saved=new Set(), read=new Set(), timer;
+  // Byte budgets protect storage and response parsing; record counts do not define validity.
+  const STATE_BYTES=4*1024*1024, INDEX_BYTES=32*1024*1024;
+  const bytes=s=>new TextEncoder().encode(s).byteLength;
+  const validState=a=>Array.isArray(a)&&a.every(x=>typeof x==='string'&&/^[a-z][a-z0-9-]{0,89}$/.test(x));
   function notify(message) {
     $('#toast').textContent=message; $('#toast').classList.add('show');
     clearTimeout(timer); timer=setTimeout(()=>$('#toast').classList.remove('show'),3300);
   }
   try {
-    const raw=JSON.parse(localStorage.getItem(KEY)||'{"saved":[],"read":[]}');
-    const valid=a=>Array.isArray(a)&&a.length<=300&&a.every(x=>typeof x==='string'&&/^[a-z][a-z0-9-]{0,89}$/.test(x));
-    if (!raw||!valid(raw.saved)||!valid(raw.read)||Object.keys(raw).some(k=>!['saved','read'].includes(k))) throw new Error('Invalid reading state');
+    initialState=localStorage.getItem(KEY);
+    const text=initialState??'{"saved":[],"read":[]}';
+    if(bytes(text)>STATE_BYTES)throw new Error('State size exceeded');
+    const raw=JSON.parse(text);
+    if (!raw||!validState(raw.saved)||!validState(raw.read)||Object.keys(raw).some(k=>!['saved','read'].includes(k))) throw new Error('Invalid reading state');
     saved=new Set(raw.saved); read=new Set(raw.read);
-  } catch { persistent=false; }
+  } catch { persistent=false; writable=false; }
   function persist() {
-    try { localStorage.setItem(KEY,JSON.stringify({saved:[...saved],read:[...read]})); persistent=true; }
+    try {
+      if(!writable)throw new Error('Preserve invalid original state');
+      if(!backedUp){const original=localStorage.getItem(KEY);if(original!==null&&!localStorage.getItem(KEY+'-backup-v1'))localStorage.setItem(KEY+'-backup-v1',original);backedUp=true;}
+      const text=JSON.stringify({saved:[...saved],read:[...read]});if(bytes(text)>STATE_BYTES)throw new Error('State size exceeded');
+      localStorage.setItem(KEY,text); persistent=true;
+    }
     catch { persistent=false; }
-    if (!persistent) notify('浏览器存储不可用：状态只在当前页面保留，不跨设备同步。');
+    if (!persistent) notify('状态未写入：备份或存储不可用、超出大小预算或原状态损坏；原值保留，新操作仅在本页，请导出当前阅读状态。');
   }
   function updateButtons() {
     $$('[data-save]').forEach(b=>{const on=saved.has(b.dataset.save);b.setAttribute('aria-pressed',String(on));b.textContent=on?'已收藏':'收藏';});
@@ -99,10 +110,24 @@
   $('#open-search').addEventListener('click',openSearch); $('#global-search').addEventListener('input',results);
   dialog.addEventListener('click',e=>{if(e.target===dialog){const r=dialog.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)dialog.close();}});
   document.addEventListener('keydown',e=>{if(e.defaultPrevented||e.isComposing)return;if(e.key==='Escape'&&dialog.open){e.preventDefault();dialog.close();return;}const editing=e.target.closest('input,textarea,[contenteditable=true]');if(!editing&&(e.key==='/'||((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'))){e.preventDefault();openSearch();}});
-  fetch(base+'assets/search.json').then(r=>{if(!r.ok)throw new Error('Index unavailable');return r.json();}).then(rows=>{
-    if(!Array.isArray(rows)||rows.length>300||rows.some(p=>!p||typeof p.slug!=='string'||!/^[a-z][a-z0-9-]{0,89}$/.test(p.slug)||typeof p.title!=='string'||typeof p.excerpt!=='string'||typeof p.text!=='string'||!Array.isArray(p.tags)||p.tags.some(t=>typeof t!=='string')||!Object.hasOwn(kinds,p.kind)))throw new Error('Invalid index');
-    index=rows; const known=new Set(rows.map(p=>p.slug));saved=new Set([...saved].filter(x=>known.has(x)));read=new Set([...read].filter(x=>known.has(x)));updateButtons();filter();if(dialog.open)results();
+  fetch(base+'assets/search.json').then(async r=>{
+    if(!r.ok)throw new Error('Index unavailable');
+    const reader=r.body.getReader(),chunks=[];let size=0;
+    while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>INDEX_BYTES){await reader.cancel();throw new Error('Index size exceeded');}chunks.push(value);}
+    const merged=new Uint8Array(size);let offset=0;for(const x of chunks){merged.set(x,offset);offset+=x.byteLength;}return JSON.parse(new TextDecoder().decode(merged));
+  }).then(rows=>{
+    if(!Array.isArray(rows)||rows.some(p=>!p||typeof p.slug!=='string'||!/^[a-z][a-z0-9-]{0,89}$/.test(p.slug)||typeof p.title!=='string'||typeof p.excerpt!=='string'||typeof p.text!=='string'||!Array.isArray(p.tags)||p.tags.some(t=>typeof t!=='string')||!Object.hasOwn(kinds,p.kind))||new Set(rows.map(p=>p.slug)).size!==rows.length)throw new Error('Invalid index');
+    index=rows;updateButtons();filter();if(dialog.open)results();
   }).catch(()=>notify('全文索引暂未加载成功；文章和导航仍可正常阅读。'));
+  function downloadState(text,name) {
+    try {const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:'application/json'}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
+    catch {notify('导出失败；原状态未改。');}
+  }
+  const exportTools=document.createElement('div');exportTools.className='state-export-tools';
+  const exportState=document.createElement('button');exportState.id='export-reading-state';exportState.className='text-button';exportState.textContent='导出当前阅读状态';exportState.type='button';
+  exportState.addEventListener('click',()=>downloadState(JSON.stringify({saved:[...saved],read:[...read]}),'franka-article-state.json'));exportTools.append(exportState);
+  if(initialState!==null){const original=document.createElement('button');original.id='export-original-state';original.className='text-button';original.textContent='导出原始状态备份';original.title='本次页面打开时的原始存储值；包含损坏原值时也逐字保留';original.type='button';original.addEventListener('click',()=>downloadState(initialState,'franka-article-state-original.json'));exportTools.append(original);}
+  document.querySelector('.site-footer')?.append(exportTools);
   const featured=$('[data-feature-index]');
   if (featured) {
     let featurePage=0; const cards=$$('[data-feature-index]'), pages=Math.ceil(cards.length/2);
